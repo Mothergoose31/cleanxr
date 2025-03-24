@@ -108,7 +108,7 @@ func CleanACB(filename string, numScales int, imageSize int) (Image, error) {
 	}
 
 	dirtyMaps := createDirtyMapsFromACB(data, numScales, imageSize)
-	psfs := createPSFsFromACB(data, numScales, imageSize)
+	psfs := createPSFsFromACB(numScales, imageSize)
 	basisFuncs := createBasisFunctionsFromACB(numScales, imageSize)
 
 	scaleBias := make([]float64, numScales)
@@ -152,7 +152,8 @@ func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
 
 	return dirtyMaps
 }
-func createPSFsFromACB(data *ACBData, numScales int, imageSize int) PFS {
+
+func createPSFsFromACB(numScales int, imageSize int) PFS {
 	psfs := make(PFS, numScales)
 
 	for s := 0; s < numScales; s++ {
@@ -218,6 +219,7 @@ func createBasisFunctionsFromACB(numScales int, imageSize int) PFS {
 
 	return basisFuncs
 }
+
 func getUniqueFrequencies(frequencies []float64) []float64 {
 	seen := make(map[float64]bool)
 	unique := []float64{}
@@ -307,6 +309,7 @@ func identifyMaxScale(rescaledDirtyMaps []Image) int {
 
 	return maxScale
 }
+
 func identifyMaxPosition(img Image) (Point, float64) {
 	maxPos := Point{}
 	maxIntensity := math.Inf(-1)
