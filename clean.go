@@ -155,7 +155,7 @@ func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
 
 func createPSFsFromACB(numScales int, imageSize int) PFS {
 	psfs := make(PFS, numScales)
-	fmt.Println("Creating PSFs")
+	fmt.Println("Creating PSFs...")
 	for s := 0; s < numScales; s++ {
 		psfs[s] = make(Image, imageSize)
 		for i := range psfs[s] {
