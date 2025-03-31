@@ -1,6 +1,5 @@
-# Multi-scale CLEAN Implementation for Radio Interferometry
+# Multi-scale CLEAN  for Radio 
 
-Implementation of the Multi-scale CLEAN algorithm for processing radio interferometric data in ACB format. Optimized for high dynamic range imaging of compact sources (AGN jets, blazar cores).
 
 ## Features
 - Multi-scale deconvolution for resolving complex source structures
