@@ -121,6 +121,7 @@ func CleanACB(filename string, numScales int, imageSize int) (Image, error) {
 }
 
 func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
+	fmt.Println("Creating dirty maps from ACB data...")
 	dirtyMaps := make(PFS, numScales)
 	for s := 0; s < numScales; s++ {
 		dirtyMaps[s] = make(Image, imageSize)
@@ -128,24 +129,50 @@ func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
 			dirtyMaps[s][i] = make([]float64, imageSize)
 		}
 	}
+
+	fmt.Println("Processing amplitude data...")
 	center := imageSize / 2
 	uniqueFreqs := getUniqueFrequencies(data.Frequencies)
+	fmt.Printf("Found %d unique frequencies\n", len(uniqueFreqs))
+	fmt.Printf("Using %d amplitude values\n", len(data.Amplitudes))
+
+	scaleSigmas := make([]float64, numScales)
+	for s := 0; s < numScales; s++ {
+		scaleSigmas[s] = 1.0 + float64(s)*2.0
+	}
+
+	gaussianLookup := make([][][]float64, numScales)
+	for s := 0; s < numScales; s++ {
+		gaussianLookup[s] = make([][]float64, imageSize)
+		for i := range gaussianLookup[s] {
+			gaussianLookup[s][i] = make([]float64, imageSize)
+			for j := range gaussianLookup[s][i] {
+				dx := float64(i - center)
+				dy := float64(j - center)
+				distance := math.Sqrt(dx*dx + dy*dy)
+				gaussianLookup[s][i][j] = math.Exp(-(distance * distance) / (2 * scaleSigmas[s] * scaleSigmas[s]))
+			}
+		}
+	}
 
 	for i, amp := range data.Amplitudes {
 		if i >= len(uniqueFreqs) {
 			break
 		}
+
+		if i%10 == 0 {
+			fmt.Printf("Processing amplitude %d/%d...\n", i+1, len(data.Amplitudes))
+		}
+
 		scaleIndex := int(float64(i) / float64(len(uniqueFreqs)) * float64(numScales))
 		if scaleIndex >= numScales {
 			scaleIndex = numScales - 1
 		}
-		sigma := 1.0 + float64(scaleIndex)*2.0
+
+		// Use pre-computed gaussian table
 		for x := 0; x < imageSize; x++ {
 			for y := 0; y < imageSize; y++ {
-				dx := float64(x - center)
-				dy := float64(y - center)
-				distance := math.Sqrt(dx*dx + dy*dy)
-				dirtyMaps[scaleIndex][x][y] += amp * math.Exp(-(distance*distance)/(2*sigma*sigma))
+				dirtyMaps[scaleIndex][x][y] += amp * gaussianLookup[scaleIndex][x][y]
 			}
 		}
 	}
@@ -154,8 +181,8 @@ func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
 }
 
 func createPSFsFromACB(numScales int, imageSize int) PFS {
-	psfs := make(PFS, numScales)
 	fmt.Println("Creating PSFs...")
+	psfs := make(PFS, numScales)
 	for s := 0; s < numScales; s++ {
 		psfs[s] = make(Image, imageSize)
 		for i := range psfs[s] {
@@ -164,8 +191,10 @@ func createPSFsFromACB(numScales int, imageSize int) PFS {
 	}
 
 	center := imageSize / 2
+	fmt.Println("Generating PSF patterns...")
 
 	for s := 0; s < numScales; s++ {
+		fmt.Printf("  Scale %d/%d...\n", s+1, numScales)
 		sigma := 1.0 + float64(s)*0.5
 
 		for x := 0; x < imageSize; x++ {
@@ -176,6 +205,8 @@ func createPSFsFromACB(numScales int, imageSize int) PFS {
 				psfs[s][x][y] = math.Exp(-(distance * distance) / (2 * sigma * sigma))
 			}
 		}
+
+		fmt.Println("  Normalizing PSF...")
 		total := 0.0
 		for x := 0; x < imageSize; x++ {
 			for y := 0; y < imageSize; y++ {
@@ -235,6 +266,7 @@ func getUniqueFrequencies(frequencies []float64) []float64 {
 }
 
 func MultiScaleClean(unclean PFS, psfs PFS, basisFuncs PFS, scaleBias []float64) Image {
+	fmt.Println("Starting Multi-scale CLEAN algorithm...")
 	numScales := len(unclean)
 	cleanComponents := make(Image, len(unclean[0]))
 	for i := range cleanComponents {
@@ -251,21 +283,30 @@ func MultiScaleClean(unclean PFS, psfs PFS, basisFuncs PFS, scaleBias []float64)
 
 	maxIterations := 50
 	iterCount := 0
+	fmt.Println("Beginning iterations...")
 
 	for iterCount < maxIterations {
+		fmt.Printf("Iteration %d/%d...\n", iterCount+1, maxIterations)
 		rescaledDirtyMaps := rescaleDirtyMaps(currentDirtyMaps, scaleBias)
 		maxScale := identifyMaxScale(rescaledDirtyMaps)
+		fmt.Printf("  Selected scale: %d\n", maxScale)
 
 		maxPos, maxIntensity := identifyMaxPosition(currentDirtyMaps[maxScale])
+		fmt.Printf("  Max position: (%d, %d), intensity: %f\n", maxPos.x, maxPos.y, maxIntensity)
 
 		if maxIntensity < 1e-5 {
+			fmt.Println("  Maximum intensity too low, stopping.")
 			break
 		}
 
+		fmt.Println("  Updating clean components...")
 		updateCleanComponents(cleanComponents, basisFuncs[maxScale], maxPos, maxIntensity, psfs[maxScale])
+
+		fmt.Println("  Updating dirty maps...")
 		updateDirtyMaps(currentDirtyMaps, basisFuncs[maxScale], maxPos, maxIntensity, psfs)
 
 		if stoppingCondition(currentDirtyMaps) {
+			fmt.Println("  Stopping condition met, ending iterations.")
 			break
 		}
 
@@ -273,6 +314,7 @@ func MultiScaleClean(unclean PFS, psfs PFS, basisFuncs PFS, scaleBias []float64)
 	}
 
 	fmt.Printf("Multi-scale CLEAN completed in %d iterations\n", iterCount)
+	fmt.Println("Adding residuals...")
 	cleanedImage := addResiduals(cleanComponents, currentDirtyMaps)
 
 	return cleanedImage

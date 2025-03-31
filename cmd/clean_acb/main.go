@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"image"
-	"image/color"
 	"image/png"
 	"log"
 	"math"
@@ -14,12 +13,106 @@ import (
 	"github.com/mothergoose31/clean"
 )
 
+// saveImageAsPNG converts our Image type to a PNG file with the Viridis colormap
+func saveImageAsPNG(img clean.Image, filename string) error {
+	// Find min and max values for normalization
+	minVal := math.Inf(1)
+	maxVal := math.Inf(-1)
+
+	for _, row := range img {
+		for _, val := range row {
+			if val < minVal {
+				minVal = val
+			}
+			if val > maxVal {
+				maxVal = val
+			}
+		}
+	}
+
+	// Create a new color image
+	imgWidth := len(img)
+	imgHeight := len(img[0])
+	pngImg := image.NewRGBA(image.Rect(0, 0, imgWidth, imgHeight))
+
+	scale := 1.0
+	if maxVal > minVal {
+		scale = 1.0 / (maxVal - minVal)
+	}
+
+	for y := 0; y < imgHeight; y++ {
+		for x := 0; x < imgWidth; x++ {
+			if x < len(img) && y < len(img[x]) {
+				// Normalize value to 0-1 range
+				normalizedValue := (img[x][y] - minVal) * scale
+				// Use the Viridis colormap from the clean package
+				pngImg.Set(x, y, clean.Viridis.ColorAt(normalizedValue))
+			}
+		}
+	}
+
+	// Save the image
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return png.Encode(f, pngImg)
+}
+
+func upsampleImage(img clean.Image, targetWidth, targetHeight int) clean.Image {
+	sourceWidth := len(img)
+	sourceHeight := len(img[0])
+
+	result := make(clean.Image, targetWidth)
+	for i := range result {
+		result[i] = make([]float64, targetHeight)
+	}
+
+	xRatio := float64(sourceWidth-1) / float64(targetWidth-1)
+	yRatio := float64(sourceHeight-1) / float64(targetHeight-1)
+
+	for y := 0; y < targetHeight; y++ {
+		for x := 0; x < targetWidth; x++ {
+			srcX := float64(x) * xRatio
+			srcY := float64(y) * yRatio
+
+			x1, y1 := int(math.Floor(srcX)), int(math.Floor(srcY))
+			x2, y2 := int(math.Ceil(srcX)), int(math.Ceil(srcY))
+
+			if x2 >= sourceWidth {
+				x2 = sourceWidth - 1
+			}
+			if y2 >= sourceHeight {
+				y2 = sourceHeight - 1
+			}
+
+			weightX := srcX - float64(x1)
+			weightY := srcY - float64(y1)
+
+			topLeft := img[x1][y1]
+			topRight := img[x2][y1]
+			bottomLeft := img[x1][y2]
+			bottomRight := img[x2][y2]
+
+			top := topLeft*(1-weightX) + topRight*weightX
+			bottom := bottomLeft*(1-weightX) + bottomRight*weightX
+
+			result[x][y] = top*(1-weightY) + bottom*weightY
+		}
+	}
+
+	return result
+}
+
 func main() {
 	// Parse command-line arguments
 	inputFile := flag.String("input", "", "Input ACB file")
 	outputFile := flag.String("output", "cleaned_image.png", "Output image file")
 	numScales := flag.Int("scales", 5, "Number of scales for Multi-scale CLEAN")
 	imageSize := flag.Int("size", 256, "Size of the output image")
+	highRes := flag.Bool("2k", false, "Generate 2K resolution image (2048x2048)")
 	flag.Parse()
 
 	if *inputFile == "" {
@@ -42,6 +135,12 @@ func main() {
 		log.Fatalf("Failed to clean ACB data: %v", err)
 	}
 
+	// Upsample to 2K if requested
+	if *highRes {
+		fmt.Println("Upsampling to 2K resolution...")
+		cleanedImage = upsampleImage(cleanedImage, 2048, 2048)
+	}
+
 	// Save the cleaned image as PNG
 	fmt.Printf("Saving cleaned image to %s...\n", *outputFile)
 	if err := saveImageAsPNG(cleanedImage, *outputFile); err != nil {
@@ -49,57 +148,4 @@ func main() {
 	}
 
 	fmt.Println("Done!")
-}
-
-// saveImageAsPNG converts our Image type to a PNG file
-func saveImageAsPNG(img clean.Image, filename string) error {
-	// Find min and max values for normalization
-	minVal := math.Inf(1)
-	maxVal := math.Inf(-1)
-
-	for _, row := range img {
-		for _, val := range row {
-			if val < minVal {
-				minVal = val
-			}
-			if val > maxVal {
-				maxVal = val
-			}
-		}
-	}
-
-	// Create a new grayscale image
-	imgWidth := len(img)
-	imgHeight := len(img[0])
-	pngImg := image.NewGray(image.Rect(0, 0, imgWidth, imgHeight))
-
-	// Normalize values to 0-255 range
-	scale := 255.0
-	if maxVal > minVal {
-		scale = 255.0 / (maxVal - minVal)
-	}
-
-	for y := 0; y < imgHeight; y++ {
-		for x := 0; x < imgWidth; x++ {
-			if x < len(img) && y < len(img[x]) {
-				normalized := (img[x][y] - minVal) * scale
-				if normalized < 0 {
-					normalized = 0
-				}
-				if normalized > 255 {
-					normalized = 255
-				}
-				pngImg.SetGray(x, y, color.Gray{uint8(normalized)})
-			}
-		}
-	}
-
-	// Save the image
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	return png.Encode(f, pngImg)
 }
