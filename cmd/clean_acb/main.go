@@ -13,9 +13,7 @@ import (
 	"github.com/mothergoose31/clean"
 )
 
-// saveImageAsPNG converts our Image type to a PNG file with the Viridis colormap
 func saveImageAsPNG(img clean.Image, filename string) error {
-	// Find min and max values for normalization
 	minVal := math.Inf(1)
 	maxVal := math.Inf(-1)
 
@@ -29,8 +27,6 @@ func saveImageAsPNG(img clean.Image, filename string) error {
 			}
 		}
 	}
-
-	// Create a new color image
 	imgWidth := len(img)
 	imgHeight := len(img[0])
 	pngImg := image.NewRGBA(image.Rect(0, 0, imgWidth, imgHeight))
@@ -43,15 +39,11 @@ func saveImageAsPNG(img clean.Image, filename string) error {
 	for y := 0; y < imgHeight; y++ {
 		for x := 0; x < imgWidth; x++ {
 			if x < len(img) && y < len(img[x]) {
-				// Normalize value to 0-1 range
 				normalizedValue := (img[x][y] - minVal) * scale
-				// Use the Viridis colormap from the clean package
 				pngImg.Set(x, y, clean.Viridis.ColorAt(normalizedValue))
 			}
 		}
 	}
-
-	// Save the image
 	f, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -107,41 +99,32 @@ func upsampleImage(img clean.Image, targetWidth, targetHeight int) clean.Image {
 }
 
 func main() {
-	// Parse command-line arguments
 	inputFile := flag.String("input", "", "Input ACB file")
 	outputFile := flag.String("output", "cleaned_image.png", "Output image file")
 	numScales := flag.Int("scales", 5, "Number of scales for Multi-scale CLEAN")
 	imageSize := flag.Int("size", 256, "Size of the output image")
 	highRes := flag.Bool("2k", false, "Generate 2K resolution image (2048x2048)")
 	flag.Parse()
-
 	if *inputFile == "" {
 		fmt.Println("Please specify an input file with -input")
 		os.Exit(1)
 	}
 
-	// Ensure output directory exists
 	outputDir := filepath.Dir(*outputFile)
 	if outputDir != "." && outputDir != "" {
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
 			log.Fatalf("Failed to create output directory: %v", err)
 		}
 	}
-
-	// Apply Multi-scale CLEAN to the ACB data
 	fmt.Printf("Applying Multi-scale CLEAN to %s with %d scales...\n", *inputFile, *numScales)
 	cleanedImage, err := clean.CleanACB(*inputFile, *numScales, *imageSize)
 	if err != nil {
 		log.Fatalf("Failed to clean ACB data: %v", err)
 	}
-
-	// Upsample to 2K if requested
 	if *highRes {
 		fmt.Println("Upsampling to 2K resolution...")
 		cleanedImage = upsampleImage(cleanedImage, 2048, 2048)
 	}
-
-	// Save the cleaned image as PNG
 	fmt.Printf("Saving cleaned image to %s...\n", *outputFile)
 	if err := saveImageAsPNG(cleanedImage, *outputFile); err != nil {
 		log.Fatalf("Failed to save image: %v", err)
