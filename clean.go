@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Point struct {
@@ -29,6 +31,34 @@ type ACBData struct {
 	Frequencies   []float64
 	Polarizations []string
 	Amplitudes    []float64
+}
+
+type workerPool struct {
+	workers int
+	wg      sync.WaitGroup
+}
+
+func newWorkerPool() *workerPool {
+	return &workerPool{
+		workers: (runtime.NumCPU() * 3) / 4,
+	}
+}
+
+func (p *workerPool) divide(total int) [][2]int {
+	chunks := make([][2]int, p.workers)
+	chunkSize := total / p.workers
+	remainder := total % p.workers
+
+	start := 0
+	for i := 0; i < p.workers; i++ {
+		size := chunkSize
+		if i < remainder {
+			size++
+		}
+		chunks[i] = [2]int{start, start + size}
+		start += size
+	}
+	return chunks
 }
 
 func ParseACB(filename string) (*ACBData, error) {
@@ -130,7 +160,6 @@ func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
 		}
 	}
 
-	fmt.Println("Processing amplitude data...")
 	center := imageSize / 2
 	uniqueFreqs := getUniqueFrequencies(data.Frequencies)
 	fmt.Printf("Found %d unique frequencies\n", len(uniqueFreqs))
@@ -142,40 +171,63 @@ func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
 	}
 
 	gaussianLookup := make([][][]float64, numScales)
+	var wg sync.WaitGroup
+	wg.Add(numScales)
+
 	for s := 0; s < numScales; s++ {
-		gaussianLookup[s] = make([][]float64, imageSize)
-		for i := range gaussianLookup[s] {
-			gaussianLookup[s][i] = make([]float64, imageSize)
-			for j := range gaussianLookup[s][i] {
-				dx := float64(i - center)
-				dy := float64(j - center)
-				distance := math.Sqrt(dx*dx + dy*dy)
-				gaussianLookup[s][i][j] = math.Exp(-(distance * distance) / (2 * scaleSigmas[s] * scaleSigmas[s]))
+		go func(scale int) {
+			defer wg.Done()
+			gaussianLookup[scale] = make([][]float64, imageSize)
+			for i := range gaussianLookup[scale] {
+				gaussianLookup[scale][i] = make([]float64, imageSize)
+				for j := range gaussianLookup[scale][i] {
+					dx := float64(i - center)
+					dy := float64(j - center)
+					distance := math.Sqrt(dx*dx + dy*dy)
+					gaussianLookup[scale][i][j] = math.Exp(-(distance * distance) / (2 * scaleSigmas[scale] * scaleSigmas[scale]))
+				}
 			}
-		}
+		}(s)
 	}
+	wg.Wait()
+	pool := newWorkerPool()
+	chunks := pool.divide(len(data.Amplitudes))
+	pool.wg.Add(len(chunks))
+	var mutex sync.Mutex
+	for _, chunk := range chunks {
+		go func(start, end int) {
+			defer pool.wg.Done()
 
-	for i, amp := range data.Amplitudes {
-		if i >= len(uniqueFreqs) {
-			break
-		}
+			for i := start; i < end && i < len(data.Amplitudes); i++ {
+				amp := data.Amplitudes[i]
+				if i >= len(uniqueFreqs) {
+					continue
+				}
 
-		if i%10 == 0 {
-			fmt.Printf("Processing amplitude %d/%d...\n", i+1, len(data.Amplitudes))
-		}
+				scaleIndex := int(float64(i) / float64(len(uniqueFreqs)) * float64(numScales))
+				if scaleIndex >= numScales {
+					scaleIndex = numScales - 1
+				}
 
-		scaleIndex := int(float64(i) / float64(len(uniqueFreqs)) * float64(numScales))
-		if scaleIndex >= numScales {
-			scaleIndex = numScales - 1
-		}
+				localUpdates := make([][]float64, imageSize)
+				for x := range localUpdates {
+					localUpdates[x] = make([]float64, imageSize)
+					for y := 0; y < imageSize; y++ {
+						localUpdates[x][y] = amp * gaussianLookup[scaleIndex][x][y]
+					}
+				}
 
-		// Use pre-computed gaussian table
-		for x := 0; x < imageSize; x++ {
-			for y := 0; y < imageSize; y++ {
-				dirtyMaps[scaleIndex][x][y] += amp * gaussianLookup[scaleIndex][x][y]
+				mutex.Lock()
+				for x := 0; x < imageSize; x++ {
+					for y := 0; y < imageSize; y++ {
+						dirtyMaps[scaleIndex][x][y] += localUpdates[x][y]
+					}
+				}
+				mutex.Unlock()
 			}
-		}
+		}(chunk[0], chunk[1])
 	}
+	pool.wg.Wait()
 
 	return dirtyMaps
 }
@@ -233,9 +285,7 @@ func createBasisFunctionsFromACB(numScales int, imageSize int) PFS {
 			basisFuncs[s][i] = make([]float64, imageSize)
 		}
 	}
-
 	center := imageSize / 2
-
 	for s := 0; s < numScales; s++ {
 		sigma := 1.0 + float64(s)*2.0
 		for x := 0; x < imageSize; x++ {
@@ -254,7 +304,6 @@ func createBasisFunctionsFromACB(numScales int, imageSize int) PFS {
 func getUniqueFrequencies(frequencies []float64) []float64 {
 	seen := make(map[float64]bool)
 	unique := []float64{}
-
 	for _, freq := range frequencies {
 		if !seen[freq] {
 			seen[freq] = true
@@ -290,33 +339,25 @@ func MultiScaleClean(unclean PFS, psfs PFS, basisFuncs PFS, scaleBias []float64)
 		rescaledDirtyMaps := rescaleDirtyMaps(currentDirtyMaps, scaleBias)
 		maxScale := identifyMaxScale(rescaledDirtyMaps)
 		fmt.Printf("  Selected scale: %d\n", maxScale)
-
 		maxPos, maxIntensity := identifyMaxPosition(currentDirtyMaps[maxScale])
 		fmt.Printf("  Max position: (%d, %d), intensity: %f\n", maxPos.x, maxPos.y, maxIntensity)
-
 		if maxIntensity < 1e-5 {
 			fmt.Println("  Maximum intensity too low, stopping.")
 			break
 		}
-
 		fmt.Println("  Updating clean components...")
 		updateCleanComponents(cleanComponents, basisFuncs[maxScale], maxPos, maxIntensity, psfs[maxScale])
-
 		fmt.Println("  Updating dirty maps...")
 		updateDirtyMaps(currentDirtyMaps, basisFuncs[maxScale], maxPos, maxIntensity, psfs)
-
 		if stoppingCondition(currentDirtyMaps) {
 			fmt.Println("  Stopping condition met, ending iterations.")
 			break
 		}
-
 		iterCount++
 	}
-
 	fmt.Printf("Multi-scale CLEAN completed in %d iterations\n", iterCount)
 	fmt.Println("Adding residuals...")
 	cleanedImage := addResiduals(cleanComponents, currentDirtyMaps)
-
 	return cleanedImage
 }
 
@@ -381,21 +422,51 @@ func updateCleanComponents(cleanComponents Image, basisFunction Image, maxPos Po
 	}
 }
 
+// TODO: This is a bottleneck need to find a better way to do this
 func updateDirtyMaps(dirtyMaps []Image, basisFunction Image, maxPos Point, maxIntensity float64, psfs []Image) {
+	pool := newWorkerPool()
+	var wg sync.WaitGroup
+	crossConvs := make([]Image, len(dirtyMaps))
+	wg.Add(len(dirtyMaps))
 	for i := range dirtyMaps {
-		crossConv := convolve(basisFunction, psfs[i])
-		for j := range crossConv {
-			for k := range crossConv[j] {
-				x := maxPos.x + j - len(crossConv)/2
-				y := maxPos.y + k - len(crossConv[j])/2
-				if x >= 0 && x < len(dirtyMaps[i]) && y >= 0 && y < len(dirtyMaps[i][x]) {
-					dirtyMaps[i][x][y] -= gainFactor * maxIntensity * crossConv[j][k] / maxValue(crossConv)
+		go func(idx int) {
+			defer wg.Done()
+			crossConvs[idx] = convolve(basisFunction, psfs[idx])
+		}(i)
+	}
+	wg.Wait()
+	chunks := pool.divide(len(dirtyMaps))
+	pool.wg.Add(len(chunks))
+	for _, chunk := range chunks {
+		go func(start, end int) {
+			defer pool.wg.Done()
+
+			for i := start; i < end; i++ {
+				crossConv := crossConvs[i]
+				normFactor := gainFactor * maxIntensity / maxValue(crossConv)
+
+				blockSize := 32
+				for j := 0; j < len(crossConv); j += blockSize {
+					for k := 0; k < len(crossConv[0]); k += blockSize {
+						endJ := min(j+blockSize, len(crossConv))
+						endK := min(k+blockSize, len(crossConv[0]))
+
+						for jj := j; jj < endJ; jj++ {
+							for kk := k; kk < endK; kk++ {
+								x := maxPos.x + jj - len(crossConv)/2
+								y := maxPos.y + kk - len(crossConv[0])/2
+								if x >= 0 && x < len(dirtyMaps[i]) && y >= 0 && y < len(dirtyMaps[i][x]) {
+									dirtyMaps[i][x][y] -= normFactor * crossConv[jj][kk]
+								}
+							}
+						}
+					}
 				}
 			}
-		}
+		}(chunk[0], chunk[1])
 	}
+	pool.wg.Wait()
 }
-
 func stoppingCondition(dirtyMaps []Image) bool {
 	threshold := 1e-5
 	for _, img := range dirtyMaps {
@@ -445,15 +516,25 @@ func convolve(img1, img2 Image) Image {
 		result[i] = make([]float64, w)
 	}
 
-	for i := 0; i < h1; i++ {
-		for j := 0; j < w1; j++ {
-			for k := 0; k < h2; k++ {
-				for l := 0; l < w2; l++ {
-					result[i+k][j+l] += img1[i][j] * img2[k][l]
+	pool := newWorkerPool()
+	chunks := pool.divide(h1)
+
+	pool.wg.Add(len(chunks))
+	for _, chunk := range chunks {
+		go func(start, end int) {
+			defer pool.wg.Done()
+			for i := start; i < end; i++ {
+				for j := 0; j < w1; j++ {
+					for k := 0; k < h2; k++ {
+						for l := 0; l < w2; l++ {
+							result[i+k][j+l] += img1[i][j] * img2[k][l]
+						}
+					}
 				}
 			}
-		}
+		}(chunk[0], chunk[1])
 	}
+	pool.wg.Wait()
 
 	return result
 }
@@ -468,4 +549,11 @@ func maxValue(img Image) float64 {
 		}
 	}
 	return maxVal
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
