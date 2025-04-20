@@ -62,6 +62,7 @@ func (p *workerPool) divide(total int) [][2]int {
 }
 
 func ParseACB(filename string) (*ACBData, error) {
+	fmt.Println("Parsing ACB file...")
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open ACB file: %v", err)
