@@ -33,6 +33,18 @@ type ACBData struct {
 	Amplitudes    []float64
 }
 
+type MultiScaleCleaner struct {
+	numScales     int
+	imageSize     int
+	gainFactor    float64
+	maxIterations int
+	threshold     float64
+	scaleBias     []float64
+	psfs          PFS
+	basisFuncs    PFS
+	pool          *workerPool
+}
+
 type workerPool struct {
 	workers int
 	wg      sync.WaitGroup
@@ -60,11 +72,11 @@ func (p *workerPool) divide(total int) [][2]int {
 	}
 	return chunks
 }
-
 func ParseACB(filename string) (*ACBData, error) {
 	fmt.Println("Parsing ACB file...")
 	file, err := os.Open(filename)
 	if err != nil {
+
 		return nil, fmt.Errorf("failed to open ACB file: %v", err)
 	}
 	defer file.Close()
