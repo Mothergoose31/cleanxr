@@ -72,11 +72,11 @@ func (p *workerPool) divide(total int) [][2]int {
 	}
 	return chunks
 }
+
 func ParseACB(filename string) (*ACBData, error) {
 	fmt.Println("Parsing ACB file...")
 	file, err := os.Open(filename)
 	if err != nil {
-
 		return nil, fmt.Errorf("failed to open ACB file: %v", err)
 	}
 	defer file.Close()
@@ -144,23 +144,210 @@ func ParseACB(filename string) (*ACBData, error) {
 	return data, nil
 }
 
+func NewMultiScaleCleaner(numScales, imageSize int, threshold float64, maxIterations int) *MultiScaleCleaner {
+	scaleBias := make([]float64, numScales)
+	for i := range scaleBias {
+		scaleBias[i] = 1.0 / math.Sqrt(float64(i+1))
+	}
+
+	return &MultiScaleCleaner{
+		numScales:     numScales,
+		imageSize:     imageSize,
+		gainFactor:    gainFactor,
+		maxIterations: maxIterations,
+		threshold:     threshold,
+		scaleBias:     scaleBias,
+		pool:          newWorkerPool(),
+	}
+}
+
 func CleanACB(filename string, numScales int, imageSize int) (Image, error) {
 	data, err := ParseACB(filename)
 	if err != nil {
 		return nil, err
 	}
 
-	dirtyMaps := createDirtyMapsFromACB(data, numScales, imageSize)
-	psfs := createPSFsFromACB(numScales, imageSize)
-	basisFuncs := createBasisFunctionsFromACB(numScales, imageSize)
+	cleaner := NewMultiScaleCleaner(numScales, imageSize, 1e-5, 50)
+	cleaner.psfs = createPSFsFromACB(numScales, imageSize)
+	cleaner.basisFuncs = createBasisFunctionsFromACB(numScales, imageSize)
 
-	scaleBias := make([]float64, numScales)
-	for i := range scaleBias {
-		scaleBias[i] = 1.0 / math.Sqrt(float64(i+1))
-	}
-	cleanedImage := MultiScaleClean(dirtyMaps, psfs, basisFuncs, scaleBias)
+	dirtyMaps := createDirtyMapsFromACB(data, numScales, imageSize)
+	cleanedImage := cleaner.Clean(dirtyMaps)
 
 	return cleanedImage, nil
+}
+
+func (msc *MultiScaleCleaner) Clean(unclean PFS) Image {
+	fmt.Println("Starting Multi-scale CLEAN algorithm...")
+	numScales := len(unclean)
+	cleanComponents := make(Image, len(unclean[0]))
+	for i := range cleanComponents {
+		cleanComponents[i] = make([]float64, len(unclean[0][i]))
+	}
+	currentDirtyMaps := make([]Image, numScales)
+	for i := range currentDirtyMaps {
+		currentDirtyMaps[i] = make(Image, len(unclean[i]))
+		for j := range currentDirtyMaps[i] {
+			currentDirtyMaps[i][j] = make([]float64, len(unclean[i][j]))
+			copy(currentDirtyMaps[i][j], unclean[i][j])
+		}
+	}
+
+	iterCount := 0
+	fmt.Println("Beginning iterations...")
+
+	for iterCount < msc.maxIterations {
+		fmt.Printf("Iteration %d/%d...\n", iterCount+1, msc.maxIterations)
+		rescaledDirtyMaps := msc.rescaleDirtyMaps(currentDirtyMaps)
+		maxScale := msc.identifyMaxScale(rescaledDirtyMaps)
+		fmt.Printf("  Selected scale: %d\n", maxScale)
+		maxPos, maxIntensity := identifyMaxPosition(currentDirtyMaps[maxScale])
+		fmt.Printf("  Max position: (%d, %d), intensity: %f\n", maxPos.x, maxPos.y, maxIntensity)
+		if maxIntensity < msc.threshold {
+			fmt.Println("  Maximum intensity below threshold, stopping.")
+			break
+		}
+		fmt.Println("  Updating clean components...")
+		msc.updateCleanComponents(cleanComponents, msc.basisFuncs[maxScale], maxPos, maxIntensity, msc.psfs[maxScale])
+		fmt.Println("  Updating dirty maps...")
+		msc.updateDirtyMaps(currentDirtyMaps, msc.basisFuncs[maxScale], maxPos, maxIntensity)
+		if msc.stoppingCondition(currentDirtyMaps) {
+			fmt.Println("  Stopping condition met, ending iterations.")
+			break
+		}
+		iterCount++
+	}
+	fmt.Printf("Multi-scale CLEAN completed in %d iterations\n", iterCount)
+	fmt.Println("Adding residuals...")
+	cleanedImage := msc.addResiduals(cleanComponents, currentDirtyMaps)
+	return cleanedImage
+}
+
+func (msc *MultiScaleCleaner) rescaleDirtyMaps(dirtyMaps []Image) []Image {
+	rescaled := make([]Image, len(dirtyMaps))
+	for i := range rescaled {
+		rescaled[i] = make(Image, len(dirtyMaps[i]))
+		for j := range rescaled[i] {
+			rescaled[i][j] = make([]float64, len(dirtyMaps[i][j]))
+			for k := range rescaled[i][j] {
+				rescaled[i][j][k] = msc.scaleBias[i] * dirtyMaps[i][j][k]
+			}
+		}
+	}
+	return rescaled
+}
+
+func (msc *MultiScaleCleaner) identifyMaxScale(rescaledDirtyMaps []Image) int {
+	maxScale := 0
+	maxIntensity := math.Inf(-1)
+
+	for i, img := range rescaledDirtyMaps {
+		for _, row := range img {
+			for _, val := range row {
+				if val > maxIntensity {
+					maxIntensity = val
+					maxScale = i
+				}
+			}
+		}
+	}
+
+	return maxScale
+}
+
+func (msc *MultiScaleCleaner) updateCleanComponents(cleanComponents Image, basisFunction Image, maxPos Point, maxIntensity float64, psf Image) {
+	normFactor := maxIntensity / maxValue(convolve(basisFunction, psf))
+	for i := range basisFunction {
+		for j := range basisFunction[i] {
+			x := maxPos.x + i - len(basisFunction)/2
+			y := maxPos.y + j - len(basisFunction[i])/2
+			if x >= 0 && x < len(cleanComponents) && y >= 0 && y < len(cleanComponents[x]) {
+				cleanComponents[x][y] += msc.gainFactor * normFactor * basisFunction[i][j]
+			}
+		}
+	}
+}
+
+func (msc *MultiScaleCleaner) updateDirtyMaps(dirtyMaps []Image, basisFunction Image, maxPos Point, maxIntensity float64) {
+	pool := msc.pool
+	var wg sync.WaitGroup
+	crossConvs := make([]Image, len(dirtyMaps))
+	wg.Add(len(dirtyMaps))
+	for i := range dirtyMaps {
+		go func(idx int) {
+			defer wg.Done()
+			crossConvs[idx] = convolve(basisFunction, msc.psfs[idx])
+		}(i)
+	}
+	wg.Wait()
+	chunks := pool.divide(len(dirtyMaps))
+	pool.wg.Add(len(chunks))
+	for _, chunk := range chunks {
+		go func(start, end int) {
+			defer pool.wg.Done()
+
+			for i := start; i < end; i++ {
+				crossConv := crossConvs[i]
+				normFactor := msc.gainFactor * maxIntensity / maxValue(crossConv)
+
+				blockSize := 32
+				for j := 0; j < len(crossConv); j += blockSize {
+					for k := 0; k < len(crossConv[0]); k += blockSize {
+						endJ := min(j+blockSize, len(crossConv))
+						endK := min(k+blockSize, len(crossConv[0]))
+
+						for jj := j; jj < endJ; jj++ {
+							for kk := k; kk < endK; kk++ {
+								x := maxPos.x + jj - len(crossConv)/2
+								y := maxPos.y + kk - len(crossConv[0])/2
+								if x >= 0 && x < len(dirtyMaps[i]) && y >= 0 && y < len(dirtyMaps[i][x]) {
+									dirtyMaps[i][x][y] -= normFactor * crossConv[jj][kk]
+								}
+							}
+						}
+					}
+				}
+			}
+		}(chunk[0], chunk[1])
+	}
+	pool.wg.Wait()
+}
+
+func (msc *MultiScaleCleaner) stoppingCondition(dirtyMaps []Image) bool {
+	for _, img := range dirtyMaps {
+		for _, row := range img {
+			for _, val := range row {
+				if math.Abs(val) > msc.threshold {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func (msc *MultiScaleCleaner) addResiduals(cleanComponents Image, dirtyMaps []Image) Image {
+	residualMap := make(Image, len(dirtyMaps[0]))
+	for i := range residualMap {
+		residualMap[i] = make([]float64, len(dirtyMaps[0][i]))
+	}
+
+	for _, img := range dirtyMaps {
+		for i := range img {
+			for j := range img[i] {
+				residualMap[i][j] += img[i][j]
+			}
+		}
+	}
+	cleanedImage := make(Image, len(cleanComponents))
+	for i := range cleanedImage {
+		cleanedImage[i] = make([]float64, len(cleanComponents[i]))
+		for j := range cleanedImage[i] {
+			cleanedImage[i][j] = cleanComponents[i][j] + residualMap[i][j]
+		}
+	}
+
+	return cleanedImage
 }
 
 func createDirtyMapsFromACB(data *ACBData, numScales int, imageSize int) PFS {
@@ -327,85 +514,6 @@ func getUniqueFrequencies(frequencies []float64) []float64 {
 	return unique
 }
 
-func MultiScaleClean(unclean PFS, psfs PFS, basisFuncs PFS, scaleBias []float64) Image {
-	fmt.Println("Starting Multi-scale CLEAN algorithm...")
-	numScales := len(unclean)
-	cleanComponents := make(Image, len(unclean[0]))
-	for i := range cleanComponents {
-		cleanComponents[i] = make([]float64, len(unclean[0][i]))
-	}
-	currentDirtyMaps := make([]Image, numScales)
-	for i := range currentDirtyMaps {
-		currentDirtyMaps[i] = make(Image, len(unclean[i]))
-		for j := range currentDirtyMaps[i] {
-			currentDirtyMaps[i][j] = make([]float64, len(unclean[i][j]))
-			copy(currentDirtyMaps[i][j], unclean[i][j])
-		}
-	}
-
-	maxIterations := 50
-	iterCount := 0
-	fmt.Println("Beginning iterations...")
-
-	for iterCount < maxIterations {
-		fmt.Printf("Iteration %d/%d...\n", iterCount+1, maxIterations)
-		rescaledDirtyMaps := rescaleDirtyMaps(currentDirtyMaps, scaleBias)
-		maxScale := identifyMaxScale(rescaledDirtyMaps)
-		fmt.Printf("  Selected scale: %d\n", maxScale)
-		maxPos, maxIntensity := identifyMaxPosition(currentDirtyMaps[maxScale])
-		fmt.Printf("  Max position: (%d, %d), intensity: %f\n", maxPos.x, maxPos.y, maxIntensity)
-		if maxIntensity < 1e-5 {
-			fmt.Println("  Maximum intensity too low, stopping.")
-			break
-		}
-		fmt.Println("  Updating clean components...")
-		updateCleanComponents(cleanComponents, basisFuncs[maxScale], maxPos, maxIntensity, psfs[maxScale])
-		fmt.Println("  Updating dirty maps...")
-		updateDirtyMaps(currentDirtyMaps, basisFuncs[maxScale], maxPos, maxIntensity, psfs)
-		if stoppingCondition(currentDirtyMaps) {
-			fmt.Println("  Stopping condition met, ending iterations.")
-			break
-		}
-		iterCount++
-	}
-	fmt.Printf("Multi-scale CLEAN completed in %d iterations\n", iterCount)
-	fmt.Println("Adding residuals...")
-	cleanedImage := addResiduals(cleanComponents, currentDirtyMaps)
-	return cleanedImage
-}
-
-func rescaleDirtyMaps(dirtyMaps []Image, scaleBias []float64) []Image {
-	rescaled := make([]Image, len(dirtyMaps))
-	for i := range rescaled {
-		rescaled[i] = make(Image, len(dirtyMaps[i]))
-		for j := range rescaled[i] {
-			rescaled[i][j] = make([]float64, len(dirtyMaps[i][j]))
-			for k := range rescaled[i][j] {
-				rescaled[i][j][k] = scaleBias[i] * dirtyMaps[i][j][k]
-			}
-		}
-	}
-	return rescaled
-}
-
-func identifyMaxScale(rescaledDirtyMaps []Image) int {
-	maxScale := 0
-	maxIntensity := math.Inf(-1)
-
-	for i, img := range rescaledDirtyMaps {
-		for _, row := range img {
-			for _, val := range row {
-				if val > maxIntensity {
-					maxIntensity = val
-					maxScale = i
-				}
-			}
-		}
-	}
-
-	return maxScale
-}
-
 func identifyMaxPosition(img Image) (Point, float64) {
 	maxPos := Point{}
 	maxIntensity := math.Inf(-1)
@@ -420,102 +528,6 @@ func identifyMaxPosition(img Image) (Point, float64) {
 	}
 
 	return maxPos, maxIntensity
-}
-
-func updateCleanComponents(cleanComponents Image, basisFunction Image, maxPos Point, maxIntensity float64, psf Image) {
-	normFactor := maxIntensity / maxValue(convolve(basisFunction, psf))
-	for i := range basisFunction {
-		for j := range basisFunction[i] {
-			x := maxPos.x + i - len(basisFunction)/2
-			y := maxPos.y + j - len(basisFunction[i])/2
-			if x >= 0 && x < len(cleanComponents) && y >= 0 && y < len(cleanComponents[x]) {
-				cleanComponents[x][y] += gainFactor * normFactor * basisFunction[i][j]
-			}
-		}
-	}
-}
-
-// TODO: This is a bottleneck need to find a better way to do this
-func updateDirtyMaps(dirtyMaps []Image, basisFunction Image, maxPos Point, maxIntensity float64, psfs []Image) {
-	pool := newWorkerPool()
-	var wg sync.WaitGroup
-	crossConvs := make([]Image, len(dirtyMaps))
-	wg.Add(len(dirtyMaps))
-	for i := range dirtyMaps {
-		go func(idx int) {
-			defer wg.Done()
-			crossConvs[idx] = convolve(basisFunction, psfs[idx])
-		}(i)
-	}
-	wg.Wait()
-	chunks := pool.divide(len(dirtyMaps))
-	pool.wg.Add(len(chunks))
-	for _, chunk := range chunks {
-		go func(start, end int) {
-			defer pool.wg.Done()
-
-			for i := start; i < end; i++ {
-				crossConv := crossConvs[i]
-				normFactor := gainFactor * maxIntensity / maxValue(crossConv)
-
-				blockSize := 32
-				for j := 0; j < len(crossConv); j += blockSize {
-					for k := 0; k < len(crossConv[0]); k += blockSize {
-						endJ := min(j+blockSize, len(crossConv))
-						endK := min(k+blockSize, len(crossConv[0]))
-
-						for jj := j; jj < endJ; jj++ {
-							for kk := k; kk < endK; kk++ {
-								x := maxPos.x + jj - len(crossConv)/2
-								y := maxPos.y + kk - len(crossConv[0])/2
-								if x >= 0 && x < len(dirtyMaps[i]) && y >= 0 && y < len(dirtyMaps[i][x]) {
-									dirtyMaps[i][x][y] -= normFactor * crossConv[jj][kk]
-								}
-							}
-						}
-					}
-				}
-			}
-		}(chunk[0], chunk[1])
-	}
-	pool.wg.Wait()
-}
-func stoppingCondition(dirtyMaps []Image) bool {
-	threshold := 1e-5
-	for _, img := range dirtyMaps {
-		for _, row := range img {
-			for _, val := range row {
-				if math.Abs(val) > threshold {
-					return false
-				}
-			}
-		}
-	}
-	return true
-}
-
-func addResiduals(cleanComponents Image, dirtyMaps []Image) Image {
-	residualMap := make(Image, len(dirtyMaps[0]))
-	for i := range residualMap {
-		residualMap[i] = make([]float64, len(dirtyMaps[0][i]))
-	}
-
-	for _, img := range dirtyMaps {
-		for i := range img {
-			for j := range img[i] {
-				residualMap[i][j] += img[i][j]
-			}
-		}
-	}
-	cleanedImage := make(Image, len(cleanComponents))
-	for i := range cleanedImage {
-		cleanedImage[i] = make([]float64, len(cleanComponents[i]))
-		for j := range cleanedImage[i] {
-			cleanedImage[i][j] = cleanComponents[i][j] + residualMap[i][j]
-		}
-	}
-
-	return cleanedImage
 }
 
 func convolve(img1, img2 Image) Image {
